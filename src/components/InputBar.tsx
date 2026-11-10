@@ -3,14 +3,16 @@ import { createPortal } from 'react-dom'
 import { deleteFavoriteCollection, useStore, submitTask, submitAgentMessage, stopAgentResponse, stopBatchPrompts, addImageFromFile, removeMultipleTasks, taskMatchesFilterStatus, taskMatchesSearchQuery } from '../store'
 import { DEFAULT_PARAMS, MAX_INPUT_IMAGES, type TaskRecord } from '../types'
 import { getActiveAgentRounds } from '../lib/agentConversationState'
-import { getActiveApiProfile, getAgentImageApiProfile, normalizeSettings, resolveApiProfileModel } from '../lib/apiProfiles'
-import { getImageGenerationModel, isGptImage25Model } from '../lib/imageModels'
+import { createSettingsForApiProfile, getCustomProviderDefinition, getActiveApiProfile, getAgentImageApiProfile, resolveApiProfileModel, normalizeSettings } from '../lib/apiProfiles'
+import { getImageModelFamily, isVectorOrAnimatedFormat } from '../lib/imageModels'
+import { getImageSearchSupport, getImageThinkingSupport } from '../lib/imageSearch'
 import { isGrokImageProfile } from '../lib/grok'
 import { isAgnesImageProfile } from '../lib/agnes'
 import { getModelPickerOptions, getModelPickerSettingsPatch } from '../lib/modelPicker'
 import { ensureImageCached, getCachedImage } from '../lib/imageCache'
+import { toReferenceImage } from '../lib/inputImages'
 import { splitBatchPrompts } from '../lib/batchPrompts'
-import { DEFAULT_FAL_IMAGE_SIZE, getChangedParams, getOutputImageLimitForSettings, normalizeParamsForSettings } from '../lib/paramCompatibility'
+import { DEFAULT_FAL_IMAGE_SIZE, getChangedParams, getOutputImageLimitForSettings, getParamDisabledReasons, normalizeParamsForSettings, supportsTransparentOutput } from '../lib/paramCompatibility'
 import { getAtImageQuery, getImageComments, getImageMentionLabel, getPromptIndexFromVisibleIndex, getPromptMentionParts, imageMentionMatches, insertImageMentionAtVisibleRange, insertTextMentionAtVisibleRange, isCursorInSelectedImageMention, stripImageMentionMarkers } from '../lib/promptImageMentions'
 import { normalizeCodexCliImageSize, normalizeImageSize } from '../lib/size'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
@@ -24,6 +26,7 @@ import { useVisibleTasks } from '../hooks/usePrivacyMode'
 import { downloadImageEntriesAsZip, downloadImageIds, formatExportFileTime, getDownloadErrorMessage, getTaskOutputImageZipEntries, withSaveLocation } from '../lib/downloadImages'
 import { pickSaveDir } from '../lib/saveFile'
 import { isTauri } from '../lib/platform'
+import type { SelectOption } from './Select'
 import SizePickerModal from './SizePickerModal'
 import { CloseIcon, CollapseIcon, ExpandIcon, LinkIcon, SketchIcon } from './icons'
 import { CommentBadge } from './CommentMarks'
@@ -32,6 +35,7 @@ import ButtonTooltip from './input/buttonTooltip'
 import DragUploadOverlay from './input/dragUploadOverlay'
 import InputBatchBars from './input/inputBatchBars'
 import InputParamsPanel from './input/inputParamsPanel'
+import MarkupOverlay from './input/markupOverlay'
 
 function getFavoriteCollectionTasksForBatch(collectionId: string, tasks: TaskRecord[], defaultFavoriteCollectionId: string | null) {
   const favoriteTasks = tasks.filter((task) => task.isFavorite)
@@ -447,7 +451,7 @@ export default function InputBar() {
     const reusedProfile = appMode !== 'agent' && settings.reuseTaskApiProfileTemporarily && reusedTaskApiProfileId
       ? settings.profiles.find((profile) => profile.id === reusedTaskApiProfileId)
       : undefined
-    return reusedProfile ? resolveApiProfileModel(reusedProfile, reusedTaskApiModel ?? undefined) : currentActiveProfile
+    return reusedProfile ? resolveApiProfileModel(reusedProfile, reusedTaskApiModel ?? undefined, getCustomProviderDefinition(settings, reusedProfile.provider)) : currentActiveProfile
   }, [appMode, currentActiveProfile, reusedTaskApiModel, reusedTaskApiProfileId, settings])
   const isTemporarilyReusedProfile = activeProfile.id !== currentActiveProfile.id
   const modelOptions = useMemo(() => getModelPickerOptions(settings, activeProfile, appMode), [settings, activeProfile, appMode])
@@ -466,11 +470,7 @@ export default function InputBar() {
     ? agentConversations.find((conversation) => conversation.id === activeAgentConversationId) ?? null
     : null
   const activeAgentIsRunning = Boolean(activeAgentConversation?.rounds.some((round) => round.status === 'running'))
-  const effectiveSettings = useMemo(() => (
-    activeProfile.id === settingsActiveProfile.id
-      ? settings
-      : normalizeSettings({ ...settings, activeProfileId: activeProfile.id })
-  ), [activeProfile.id, settingsActiveProfile.id, settings])
+  const effectiveSettings = useMemo(() => createSettingsForApiProfile(settings, activeProfile), [settings, activeProfile])
   const hasSubmitApiConfig = Boolean(activeProfile.apiKey)
   // 批量进行中暂停画廊和 Agent 的提交，需等待完成或停止后再提交
   const batchRunning = Boolean(batchProgress)
@@ -519,35 +519,34 @@ export default function InputBar() {
   const isAgnesProvider = isAgnesImageProfile(activeProfile)
   const agentAutoImageCount = appMode === 'agent'
   const moderationDisabled = isFalProvider || isGrokProvider || isAgnesProvider
+  // Agent 只用位图，SVG 和 GIF 在提交时换成 PNG，参数面板按实际发送的格式显示
+  const panelParams = appMode === 'agent' && isVectorOrAnimatedFormat(params.output_format)
+    ? { ...params, output_format: 'png' as const }
+    : params
   const transparentOutputAvailable = appMode === 'gallery'
-  const showTransparentOutputControl = transparentOutputAvailable && (params.output_format === 'png' || params.output_format === 'webp')
+  const showTransparentOutputControl = transparentOutputAvailable && supportsTransparentOutput(effectiveSettings, activeProfile, params.output_format)
   const transparentOutputEnabled = transparentOutputAvailable && showTransparentOutputControl && params.transparent_output
-  const compressionDisabled = params.output_format === 'png' || isFalProvider || isGrokProvider || isAgnesProvider
+  const compressionDisabled = panelParams.output_format === 'png' || isVectorOrAnimatedFormat(panelParams.output_format) || isFalProvider || isGrokProvider || isAgnesProvider
+  // 不可用的参数和格式仍然显示，置灰并说明原因
+  const disabledReasons = getParamDisabledReasons(activeProfile, { hasInputImages: inputImages.length > 0, agent: appMode === 'agent' })
   const outputImageLimit = getOutputImageLimitForSettings(effectiveSettings)
-  const isFalTextToImage = isFalProvider && inputImages.length === 0
   const nDraftValue = Number(nInput)
   const effectiveNValue = Number.isNaN(nDraftValue) ? params.n : nDraftValue
-  const streamConcurrentByN = activeProfile.provider === 'openai' && activeProfile.streamImages === true && !agentAutoImageCount && effectiveNValue > 1
+  const streamConcurrentByN = activeProfile.provider === 'openai' && !getImageModelFamily(activeProfile) && activeProfile.streamImages === true && !agentAutoImageCount && effectiveNValue > 1
   const nLimitHintText = agentAutoImageCount
     ? 'Agent 模式下数量由模型根据提示词自动决定'
-    : isFalProvider
-    ? `fal.ai 最大请求数量为 ${outputImageLimit}`
-    : `${isGrokProvider ? 'Grok' : isAgnesProvider ? 'Agnes' : 'OpenAI'} 最大请求数量为 ${outputImageLimit}`
-  const displaySize = isFalTextToImage && params.size === 'auto'
+    : `最大请求数量为 ${outputImageLimit}`
+  const displaySize = disabledReasons.autoSize && params.size === 'auto'
     ? DEFAULT_FAL_IMAGE_SIZE
     : (isAgnesProvider ? params.size : activeProfile.codexCli ? normalizeCodexCliImageSize(params.size) : normalizeImageSize(params.size)) || DEFAULT_PARAMS.size
 
-  const qualityOptions = [
-    ...(!isFalProvider && !isGrokProvider ? [{ label: 'auto', value: 'auto' }] : []),
+  const qualityOptions: SelectOption[] = [
+    { label: 'auto', value: 'auto', disabledReason: disabledReasons.autoQuality },
     { label: 'low', value: 'low' },
     { label: 'medium', value: 'medium' },
-    ...(!isGrokProvider ? [{ label: 'high', value: 'high' }] : []),
-    ...(!isGrokProvider && isGptImage25Model(getImageGenerationModel(activeProfile))
-      ? [
-          { label: 'xhigh', value: 'xhigh' },
-          { label: 'max', value: 'max' },
-        ]
-      : []),
+    { label: 'high', value: 'high' },
+    { label: 'xhigh', value: 'xhigh', disabledReason: disabledReasons.extendedQuality },
+    { label: 'max', value: 'max', disabledReason: disabledReasons.extendedQuality },
   ]
   const atImageLimit = inputImages.length >= MAX_INPUT_IMAGES
   const uploadImageTooltipText = atImageLimit ? `参考图数量已达上限（${MAX_INPUT_IMAGES} 张），无法继续添加` : '添加图片'
@@ -557,8 +556,9 @@ export default function InputBar() {
   }, [transparentOutputHint.hide])
   const compressionHint = useHintTooltip({ enabled: () => compressionDisabled })
   const moderationHint = useHintTooltip({ enabled: () => moderationDisabled })
-  const sizeHint = useHintTooltip({ enabled: () => isFalTextToImage || activeProfile.codexCli })
-  const qualityHint = useHintTooltip({ enabled: () => activeProfile.codexCli || isFalProvider })
+  const complexityHint = useHintTooltip({ enabled: () => Boolean(disabledReasons.complexity) })
+  const sizeHint = useHintTooltip({ enabled: () => Boolean(disabledReasons.autoSize) || activeProfile.codexCli })
+  const qualityHint = useHintTooltip({ enabled: () => activeProfile.codexCli || Boolean(getImageModelFamily(activeProfile)) })
   const nLimitHint = useHintTooltip({ autoHideMs: 2000 })
   const streamConcurrentHint = useHintTooltip({ enabled: () => streamConcurrentByN })
   const maskTargetImage = maskDraft
@@ -693,10 +693,12 @@ export default function InputBar() {
   useEffect(() => {
     const normalizedParams = normalizeParamsForSettings(params, effectiveSettings, { hasInputImages: inputImages.length > 0 })
     const patch = getChangedParams(params, normalizedParams)
+    // SVG 和 GIF 是画廊的选择，Agent 提交时会自行换成位图，这里不改写，切回画廊后仍然保留
+    if (appMode === 'agent' && isVectorOrAnimatedFormat(params.output_format)) delete patch.output_format
     if (Object.keys(patch).length) {
       setParams(patch)
     }
-  }, [inputImages.length, params, effectiveSettings, setParams])
+  }, [appMode, inputImages.length, params, effectiveSettings, setParams])
 
   useEffect(() => () => {
     if (imageHintTimerRef.current != null) {
@@ -1045,7 +1047,7 @@ export default function InputBar() {
             showToast('部分图片已不存在', 'error')
             return
           }
-          addInputImage({ id: imageId, dataUrl })
+          addInputImage(await toReferenceImage(imageId, dataUrl))
         })).then(() => {
           showToast('已上传图片', 'success')
         }).catch((err) => showToast(`上传图片失败：${err instanceof Error ? err.message : String(err)}`, 'error'))
@@ -1499,13 +1501,13 @@ export default function InputBar() {
         )}
         <div
           className={`relative w-[52px] h-[52px] rounded-xl overflow-hidden shadow-sm cursor-grab active:cursor-grabbing select-none ${
-            isMaskTarget || commentCount > 0
+            isMaskTarget || commentCount > 0 || img.markupImageId
               ? 'border-2 border-blue-500'
               : 'border border-gray-200 dark:border-white/[0.08]'
           }`}
           onClick={() => {
             if (suppressImageClickRef.current) return
-            setLightboxImageId(img.id, inputImages.map((i) => i.id), prompt)
+            setLightboxImageId(img.id, inputImages.map((i) => i.id), prompt, Object.fromEntries(inputImages.map((i) => [i.id, i.markupImageId])))
           }}
         >
           {displaySrc && (
@@ -1517,6 +1519,7 @@ export default function InputBar() {
               />
             </div>
           )}
+          {img.markupImageId && <MarkupOverlay key={img.markupImageId} imageId={img.markupImageId} />}
           {isMaskTarget && (
             <span className="absolute left-1 top-1 rounded bg-blue-500/90 px-1.5 py-0.5 text-[8px] leading-none text-white font-bold tracking-wider backdrop-blur-sm z-10 pointer-events-none">
               MASK
@@ -1530,7 +1533,7 @@ export default function InputBar() {
             className="absolute inset-0 w-full h-full bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center cursor-pointer z-20 focus:outline-none border-none"
             onClick={(e) => {
               e.stopPropagation()
-              setLightboxImageId(img.id, inputImages.map((i) => i.id), prompt)
+              setLightboxImageId(img.id, inputImages.map((i) => i.id), prompt, Object.fromEntries(inputImages.map((i) => [i.id, i.markupImageId])))
             }}
             title="查看"
             aria-label="查看参考图"
@@ -1688,14 +1691,15 @@ export default function InputBar() {
 
   const renderParams = () => (
     <InputParamsPanel
-      params={params}
+      params={panelParams}
       setParams={setParams}
       activeProfile={activeProfile}
       modelValue={JSON.stringify([activeProfile.id, activeProfile.model])}
+      searchSupport={getImageSearchSupport(activeProfile, getCustomProviderDefinition(settings, activeProfile.provider))}
+      thinkingSupport={getImageThinkingSupport(activeProfile, getCustomProviderDefinition(settings, activeProfile.provider))}
       modelOptions={modelOptions}
       onModelChange={handleModelChange}
       isFalProvider={isFalProvider}
-      isFalTextToImage={isFalTextToImage}
       displaySize={displaySize}
       qualityOptions={qualityOptions}
       selectClass={selectClass}
@@ -1711,6 +1715,9 @@ export default function InputBar() {
       commitOutputCompression={commitOutputCompression}
       moderationHint={moderationHint}
       moderationDisabled={moderationDisabled}
+      complexityHint={complexityHint}
+      disabledReasons={disabledReasons}
+      hasInputImages={inputImages.length > 0}
       agentAutoImageCount={agentAutoImageCount}
       outputImageLimit={outputImageLimit}
       nInput={nInput}
@@ -1752,10 +1759,10 @@ export default function InputBar() {
 
       {showSizePicker && (
         <SizePickerModal
-          currentSize={isFalTextToImage && params.size === 'auto' ? DEFAULT_FAL_IMAGE_SIZE : params.size}
+          currentSize={disabledReasons.autoSize && params.size === 'auto' ? DEFAULT_FAL_IMAGE_SIZE : params.size}
           onSelect={(size) => setParams({ size })}
           onClose={() => setShowSizePicker(false)}
-          allowAuto={!isFalTextToImage && !isAgnesProvider}
+          autoDisabledReason={isAgnesProvider ? 'Agnes 使用固定输出尺寸' : disabledReasons.autoSize}
           codexCli={activeProfile.codexCli}
           agnes={isAgnesProvider}
         />

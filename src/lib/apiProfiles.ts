@@ -23,7 +23,7 @@ import { shouldUseApiProxy } from './devProxy'
 import { normalizeReasoningEffort, normalizeStreamPartialImages, parseDefaultApiUrl } from './defaultApiUrl'
 import { readRuntimeEnv } from './runtimeEnv'
 import { isImportableConfigUrl } from './importableConfigUrl'
-import { DEFAULT_IMAGES_MODEL } from './imageModels'
+import { DEFAULT_IMAGES_MODEL, getImageModelFamily } from './imageModels'
 import { DEFAULT_GROK_BASE_URL, DEFAULT_GROK_MODEL, isGrokImageProfile } from './grok'
 import { DEFAULT_AGNES_BASE_URL, DEFAULT_AGNES_MODEL, isAgnesImageProfile } from './agnes'
 import { DEFAULT_BATCH_PROMPT_CONCURRENCY, normalizeBatchPromptConcurrency } from './batchPrompts'
@@ -42,10 +42,14 @@ export { DEFAULT_IMAGES_MODEL } from './imageModels'
 export const DEFAULT_RESPONSES_MODEL = 'gpt-6.1-sol'
 export const DEFAULT_FAL_BASE_URL = 'https://fal.run'
 export const DEFAULT_FAL_MODEL = 'openai/gpt-image-2'
+export const NATIVE_IMAGE_PROVIDERS = {
+  google: { name: 'Google', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', model: 'gemini-nano-banana-2.1' },
+  xai: { name: 'xAI', baseUrl: 'https://api.x.ai/v1', model: 'grok-imagine-image-2.0' },
+}
 export const DEFAULT_OPENAI_PROFILE_ID = 'default-openai'
 export const DEFAULT_API_TIMEOUT = 600
 
-const BUILT_IN_PROVIDER_IDS = new Set<ApiProvider>(['openai', 'sb2api-async', 'fal', 'grok', 'agnes'])
+const BUILT_IN_PROVIDER_IDS = new Set<ApiProvider>(['openai', 'google', 'xai', 'sb2api-async', 'fal', 'grok', 'agnes'])
 const DEFAULT_CUSTOM_PROVIDER_PATHS = {
   generationPath: 'images/generations',
   editPath: 'images/edits',
@@ -151,7 +155,7 @@ function normalizeZipDownloadRoutes(value: unknown) {
 function normalizeProviderOrder(value: unknown, customProviders: CustomProviderDefinition[]): string[] | undefined {
   if (!Array.isArray(value)) return undefined
 
-  const providerIds = ['openai', 'sb2api-async', 'fal', 'grok', 'agnes', ...customProviders.map((provider) => provider.id)]
+  const providerIds = ['openai', 'google', 'xai', 'sb2api-async', 'fal', 'grok', 'agnes', ...customProviders.map((provider) => provider.id)]
   const knownIds = new Set(providerIds)
   const ordered = value
     .map(String)
@@ -361,6 +365,13 @@ export function normalizeCustomProviderDefinition(input: unknown, usedIds = new 
       result: DEFAULT_OPENAI_RESULT,
     }) : undefined,
     poll: normalizePollMapping(record.poll),
+    modelOverrides: Array.isArray(record.modelOverrides) ? record.modelOverrides.flatMap((item) => {
+      if (!isRecord(item) || !Array.isArray(item.models) || !isRecord(item.submit)) return []
+      const models = normalizeStringArray(item.models, [])
+      if (!models.length) return []
+      const mapping = normalizeCustomProviderDefinition({ name: rawName, submit: item.submit, editSubmit: item.editSubmit, poll: item.poll })
+      return mapping ? [{ models, submit: mapping.submit, editSubmit: mapping.editSubmit, poll: mapping.poll }] : []
+    }) : undefined,
   }
 }
 
@@ -489,6 +500,23 @@ export function switchApiProfileProvider(profile: ApiProfile, provider: ApiProvi
       transparentBackgroundMethod: 'local',
       providerDrafts,
     })
+  }
+
+  if (provider === 'google' || provider === 'xai') {
+    const defaults = NATIVE_IMAGE_PROVIDERS[provider]
+    return {
+      ...profile,
+      provider,
+      baseUrl: savedDraft?.baseUrl ?? defaults.baseUrl,
+      model: savedDraft?.model ?? defaults.model,
+      apiMode: 'images',
+      codexCli: false,
+      apiProxy: false,
+      streamImages: false,
+      responseFormatB64Json: savedDraft?.responseFormatB64Json,
+      transparentBackgroundMethod: 'local',
+      providerDrafts,
+    }
   }
 
   if (provider === 'fal') {
@@ -622,7 +650,10 @@ export function normalizeApiProfile(
   const rawProvider = typeof record.provider === 'string' ? record.provider : ''
   const provider: ApiProvider = BUILT_IN_PROVIDER_IDS.has(rawProvider) || customProviderIds.has(rawProvider) ? rawProvider : 'openai'
   const apiMode: ApiMode = provider === 'openai' && record.apiMode === 'responses' ? 'responses' : 'images'
-  const providerFallback = customProviderIds.has(provider)
+  const nativeProvider = provider === 'google' || provider === 'xai' ? NATIVE_IMAGE_PROVIDERS[provider] : null
+  const providerFallback = nativeProvider
+    ? { baseUrl: nativeProvider.baseUrl, model: nativeProvider.model, transparentBackgroundMethod: 'local' as const, ...fallback }
+    : customProviderIds.has(provider)
     ? { transparentBackgroundMethod: 'local' as const, ...fallback }
     : fallback
   const defaults = provider === 'fal'
@@ -639,7 +670,7 @@ export function normalizeApiProfile(
   const streamImages = provider === 'openai' && !isGrok && !isAgnes
     ? typeof record.streamImages === 'boolean' ? record.streamImages : defaults.streamImages
     : false
-  const nativeTransparentBackgroundUnavailable = customProviderIds.has(provider) && !nativeTransparentProviderIds.has(provider)
+  const nativeTransparentBackgroundUnavailable = Boolean(nativeProvider) || (customProviderIds.has(provider) && !nativeTransparentProviderIds.has(provider))
 
   return {
     ...defaults,
@@ -659,7 +690,7 @@ export function normalizeApiProfile(
     timeout: typeof record.timeout === 'number' && Number.isFinite(record.timeout) ? record.timeout : defaults.timeout,
     apiMode,
     reasoningEffort: normalizeReasoningEffort(record.reasoningEffort, defaults.reasoningEffort),
-    codexCli: !isGrok && !isAgnes && Boolean(record.codexCli),
+    codexCli: !nativeProvider && !isGrok && !isAgnes && Boolean(record.codexCli),
     apiProxy: provider === 'sb2api-async' ? false : typeof record.apiProxy === 'boolean' ? record.apiProxy : defaults.apiProxy,
     responseFormatB64Json: isGrok || isAgnes || record.responseFormatB64Json === true ? true : undefined,
     streamImages,
@@ -667,6 +698,7 @@ export function normalizeApiProfile(
     transparentBackgroundMethod: isGrok || isAgnes ? 'local' : !nativeTransparentBackgroundUnavailable && (record.transparentBackgroundMethod === 'api' || record.transparentBackgroundMethod === 'local')
       ? record.transparentBackgroundMethod
       : defaults.transparentBackgroundMethod,
+    svgModel: typeof record.svgModel === 'string' && record.svgModel.trim() ? record.svgModel.trim() : undefined,
     providerDrafts: normalizeProviderDrafts(record.providerDrafts, customProviderIds, nativeTransparentProviderIds),
   }
 }
@@ -751,7 +783,7 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
   const record = input && typeof input === 'object' ? input as Record<string, unknown> : {}
   const customProviders = normalizeCustomProviderDefinitions(record.customProviders)
   const customProviderIds = new Set(customProviders.map((provider) => provider.id))
-  const nativeTransparentProviderIds = new Set(customProviders.filter(customProviderSupportsNativeTransparentBackground).map((provider) => provider.id))
+  const nativeTransparentProviderIds = new Set(customProviders.filter((provider) => customProviderSupportsNativeTransparentBackground(provider)).map((provider) => provider.id))
   const legacyApiMode: ApiMode = record.apiMode === 'responses' ? 'responses' : 'images'
   const legacyProfile = normalizeApiProfile({
     baseUrl: typeof record.baseUrl === 'string' ? record.baseUrl : DEFAULT_BASE_URL,
@@ -807,8 +839,10 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
     persistInputOnRestart: typeof record.persistInputOnRestart === 'boolean' ? record.persistInputOnRestart : true,
     reuseTaskApiProfileTemporarily: typeof record.reuseTaskApiProfileTemporarily === 'boolean' ? record.reuseTaskApiProfileTemporarily : false,
     alwaysShowRetryButton: typeof record.alwaysShowRetryButton === 'boolean' ? record.alwaysShowRetryButton : false,
+    saveTasksToActiveFavoriteCollection: typeof record.saveTasksToActiveFavoriteCollection === 'boolean' ? record.saveTasksToActiveFavoriteCollection : true,
     retryMode: normalizeRetryMode(record.retryMode, record.alwaysShowRetryButton === true),
     allowPromptRewrite: typeof record.allowPromptRewrite === 'boolean' ? record.allowPromptRewrite : false,
+    imagePromptHints: typeof record.imagePromptHints === 'boolean' ? record.imagePromptHints : true,
     taskCompletionNotification: typeof record.taskCompletionNotification === 'boolean' ? record.taskCompletionNotification : false,
     autoCheckUpdate: typeof record.autoCheckUpdate === 'boolean' ? record.autoCheckUpdate : true,
     writeLogFile: typeof record.writeLogFile === 'boolean' ? record.writeLogFile : true,
@@ -843,14 +877,14 @@ export function getAgentTextApiProfile(settings: Partial<AppSettings> | unknown)
   const normalized = normalizeSettings(settings)
   if (normalized.agentApiConfigMode === 'off') return getActiveApiProfile(normalized)
   const profile = normalized.profiles.find((item) => item.id === normalized.agentTextProfileId)
-  return profile ? resolveApiProfileModel(profile) : null
+  return profile ? resolveApiProfileModel(profile, undefined, getCustomProviderDefinition(normalized, profile.provider)) : null
 }
 
 export function getAgentImageApiProfile(settings: Partial<AppSettings> | unknown): ApiProfile | null {
   const normalized = normalizeSettings(settings)
   if (normalized.agentApiConfigMode !== 'hybrid') return getAgentTextApiProfile(normalized)
   const profile = normalized.profiles.find((item) => item.id === normalized.agentImageProfileId)
-  return profile ? resolveApiProfileModel(profile) : null
+  return profile ? resolveApiProfileModel(profile, undefined, getCustomProviderDefinition(normalized, profile.provider)) : null
 }
 
 export function getCustomProviderDefinition(settings: Partial<AppSettings> | unknown, provider: ApiProvider): CustomProviderDefinition | null {
@@ -862,6 +896,7 @@ export function getCustomProviderDefinition(settings: Partial<AppSettings> | unk
 export function getApiProviderLabel(settings: Partial<AppSettings> | unknown, provider: ApiProvider): string {
   if (provider === 'grok') return 'Grok'
   if (provider === 'agnes') return 'Agnes'
+  if (provider === 'google' || provider === 'xai') return NATIVE_IMAGE_PROVIDERS[provider].name
   if (provider === 'fal') return 'fal.ai'
   if (provider === 'openai') return 'OpenAI'
   if (provider === 'sb2api-async') return SUB2API_PROVIDER.name
@@ -902,7 +937,8 @@ export function getPresetAgentSettings(agent: PresetAgentConfig | undefined): Pa
 
 function validateCustomProviderTaskMappings(providers: CustomProviderDefinition[]) {
   const invalid = providers.find((provider) =>
-    (provider.submit.taskIdPath || provider.editSubmit?.taskIdPath) && !provider.poll,
+    ((provider.submit.taskIdPath || provider.editSubmit?.taskIdPath) && !provider.poll)
+    || provider.modelOverrides?.some((item) => (item.submit.taskIdPath || item.editSubmit?.taskIdPath) && !item.poll && !provider.poll),
   )
   if (invalid) throw new Error(`自定义服务商「${invalid.name}」配置了 taskIdPath，但缺少 poll`)
 }
@@ -940,7 +976,7 @@ export function importCustomProviderSettingsFromJson(
     }
     validateCustomProviderTaskMappings(customProviders)
     const customProviderIds = new Set(customProviders.map((provider) => provider.id))
-    const nativeTransparentProviderIds = new Set(customProviders.filter(customProviderSupportsNativeTransparentBackground).map((provider) => provider.id))
+    const nativeTransparentProviderIds = new Set(customProviders.filter((provider) => customProviderSupportsNativeTransparentBackground(provider)).map((provider) => provider.id))
     const profileEntries = normalizeDeploymentProfileEntries(record.profiles, customProviderIds, nativeTransparentProviderIds, options.deploymentConfig)
     const profiles = profileEntries.map((entry) => entry.profile)
     if (!options.deploymentConfig) return { customProviders, profiles }
@@ -983,10 +1019,14 @@ export function normalizeModelList(value: string) {
 }
 
 /** 将模型列表解析为实际请求使用的单个模型，优先使用 preferred，其次是首页选中的模型 */
-export function resolveApiProfileModel(profile: ApiProfile, preferred?: string): ApiProfile {
+export function resolveApiProfileModel(profile: ApiProfile, preferred?: string, customProvider?: CustomProviderDefinition | null): ApiProfile {
   const models = splitModelList(profile.model)
   const model = [preferred, profile.selectedModel].find((item) => item && models.includes(item)) ?? models[0] ?? profile.model
-  return { ...profile, model }
+  const resolved = { ...profile, model }
+  if (getImageModelFamily(resolved)) return { ...resolved, codexCli: false, transparentBackgroundMethod: 'local' }
+  return customProvider && !customProviderSupportsNativeTransparentBackground(customProvider, model)
+    ? { ...resolved, transparentBackgroundMethod: 'local' }
+    : resolved
 }
 
 export function getActiveApiProfile(settings: Partial<AppSettings> | unknown): ApiProfile {
@@ -1008,6 +1048,22 @@ export function getActiveApiProfile(settings: Partial<AppSettings> | unknown): A
     apiProxy: typeof record.apiProxy === 'boolean' ? record.apiProxy : profile.apiProxy,
     streamImages: profile.provider === 'openai' && typeof record.streamImages === 'boolean' ? record.streamImages : profile.streamImages,
     streamPartialImages: normalizeStreamPartialImages(record.streamPartialImages, profile.streamPartialImages),
+  }, undefined, getCustomProviderDefinition(normalized, profile.provider))
+}
+
+export function createSettingsForApiProfile(settings: AppSettings, profile: ApiProfile): AppSettings {
+  const normalized = normalizeSettings(settings)
+  return normalizeSettings({
+    ...normalized,
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: profile.model,
+    timeout: profile.timeout,
+    apiMode: profile.apiMode,
+    codexCli: profile.codexCli,
+    apiProxy: profile.apiProxy,
+    profiles: normalized.profiles.map((item) => item.id === profile.id ? profile : item),
+    activeProfileId: profile.id,
   })
 }
 
@@ -1070,6 +1126,11 @@ function createPresetProfileId(provider: ApiProvider, record: Record<string, unk
   }
   usedIds.add(id)
   return id
+}
+
+/** 配置内容比较忽略本地身份和默认标记，输入须已规整 */
+export function getApiProfileContentKey(profile: ApiProfile): string {
+  return JSON.stringify({ ...profile, id: undefined, isDefault: undefined })
 }
 
 function getApiProfileDedupKey(profile: ApiProfile): string {
@@ -1229,6 +1290,7 @@ const PRESET_PROFILE_DEPLOYMENT_KEYS = [
   'streamImages',
   'streamPartialImages',
   'transparentBackgroundMethod',
+  'svgModel',
   'providerDrafts',
 ] as const
 
@@ -1263,7 +1325,7 @@ export function mergePresetImportedSettings(
   const normalizedImported = normalizeSettings(importedSettings)
   const current = normalizeSettings(currentSettings)
   const customProviderIds = new Set(normalizedImported.customProviders.map((provider) => provider.id))
-  const nativeTransparentProviderIds = new Set(normalizedImported.customProviders.filter(customProviderSupportsNativeTransparentBackground).map((provider) => provider.id))
+  const nativeTransparentProviderIds = new Set(normalizedImported.customProviders.filter((provider) => customProviderSupportsNativeTransparentBackground(provider)).map((provider) => provider.id))
   const allSourceProfileEntries = normalizeDeploymentProfileEntries(importedRecord.profiles, customProviderIds, nativeTransparentProviderIds, true).map((entry) => ({
     profile: entry.profile,
     source: entry.source,
@@ -1300,7 +1362,7 @@ export function mergePresetImportedSettings(
     .filter((profile) => {
       const previous = previousProfilesById.get(profile.id)
       if (!previous || sourceProfileIds.has(profile.id) || usedPresetProfileIds.has(profile.id) || modifiedProviderIds.has(profile.provider)) return false
-      return JSON.stringify({ ...profile, isDefault: undefined }) === JSON.stringify({ ...previous, isDefault: undefined })
+      return getApiProfileContentKey(profile) === getApiProfileContentKey(previous)
     })
     .map((profile) => profile.id))
 
@@ -1400,8 +1462,10 @@ export const DEFAULT_SETTINGS: AppSettings = normalizeSettings({
   persistInputOnRestart: true,
   reuseTaskApiProfileTemporarily: false,
   alwaysShowRetryButton: false,
+  saveTasksToActiveFavoriteCollection: true,
   retryMode: 'new',
   allowPromptRewrite: false,
+  imagePromptHints: true,
   taskCompletionNotification: false,
   autoCheckUpdate: true,
   writeLogFile: true,

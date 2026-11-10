@@ -15,6 +15,10 @@
     {
       "source": "/grok-api/images/edits",
       "destination": "https://grok.aisenno.com/v1/images/edits"
+    },
+    {
+      "source": "/grok-api/images/tasks/:taskId",
+      "destination": "https://grok.aisenno.com/v1/images/tasks/:taskId"
     }
   ]
 }

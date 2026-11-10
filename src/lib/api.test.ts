@@ -73,8 +73,9 @@ describe('callImageApi', () => {
       prompt: 'Make it blue',
       n: 1,
       quality: 'medium',
+      resolution: '1k',
       response_format: 'b64_json',
-      ...(count === 1 ? { image: { url: images[0] } } : { images: images.map((url) => ({ url })) }),
+      ...(count === 1 ? { image: { type: 'image_url', url: images[0] } } : { images: images.map((url) => ({ type: 'image_url', url })) }),
     })
   })
 
@@ -1845,7 +1846,7 @@ describe('callImageApi', () => {
 
     expect(fetchMock.mock.calls[0][0]).toBe('https://sub2api.example.com/v1/images/generations/async')
     expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toMatchObject({
-      model: 'gpt-image-2.5-sunburst',
+      model: DEFAULT_IMAGES_MODEL,
       prompt: 'prompt',
       n: 1,
     })

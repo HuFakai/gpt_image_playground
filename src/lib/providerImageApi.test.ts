@@ -9,6 +9,22 @@ afterEach(() => {
 })
 
 describe('Grok gateway retries', () => {
+  it('keeps the gateway retry when an OpenAI profile uses the native Grok model path', async () => {
+    vi.useFakeTimers()
+    const profile = createDefaultOpenAIProfile({ apiKey: 'grok-key', model: 'grok-imagine-image-2.0' })
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response('Bad gateway', { status: 502 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ b64_json: 'aW1hZ2U=' }] })))
+    const request = callImageApi({
+      settings: normalizeSettings({ ...DEFAULT_SETTINGS, profiles: [profile], activeProfileId: profile.id }),
+      prompt: 'A circle', params: DEFAULT_PARAMS, inputImageDataUrls: [],
+    })
+    await vi.advanceTimersByTimeAsync(1000)
+    expect((await request).images).toHaveLength(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]).toEqual(fetchMock.mock.calls[0])
+  })
+
   it.each([502, 503, 504, 520, 521, 522, 523, 524])('retries HTTP %s once with the same request', async (status) => {
     vi.useFakeTimers()
     const profile = createDefaultGrokProfile({ apiKey: 'grok-key' })
